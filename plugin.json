@@ -1,0 +1,12 @@
+{
+  "name": "duo-team",
+  "displayName": "Duo-Team (Gemini + GPT)",
+  "version": "0.4.0",
+  "description": "Subscription-native Gemini + GPT (Codex CLI) multi-agent collaboration plugin with persistent project ledger, 6 teamwork modes, live steer/rework loops, and an embedded visual workbench.",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "启动 Duo-Team 规划执行模式：先检查 Codex 状态，然后制定项目任务拆解计划并让 Codex 评审",
+    "启动双盲并行研究模式：让 Gemini 和 Codex 独立分析当前项目材料，再交叉对比分歧",
+    "打开 Duo-Team 可视化工作台，查看当前项目任务看板、协作流与 Codex 实时额度"
+  ]
+}

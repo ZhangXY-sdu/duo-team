@@ -1,0 +1,54 @@
+{
+  "name": "duo-team",
+  "version": "0.4.0",
+  "description": "Subscription-native Gemini (Antigravity) + GPT (OpenAI Codex CLI) multi-agent collaboration plugin with multi-tier subscription adaptation, intelligent DAG scheduling, self-healing verification, SQLite FTS5 tiered memory, and an embedded MCP App workbench.",
+  "author": "ZhangXY-sdu",
+  "homepage": "https://github.com/ZhangXY-sdu/duo-team#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ZhangXY-sdu/duo-team.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ZhangXY-sdu/duo-team/issues"
+  },
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "keywords": [
+    "antigravity",
+    "codex",
+    "gemini",
+    "gpt",
+    "multi-agent",
+    "mcp",
+    "mcp-app",
+    "orchestration",
+    "dag-scheduler"
+  ],
+  "scripts": {
+    "build": "npm run build:server && npm run build:ui",
+    "build:server": "tsc -p server/tsconfig.json",
+    "build:ui": "vite build --config ui/vite.config.ts",
+    "typecheck": "tsc -p server/tsconfig.json --noEmit && tsc -p ui/tsconfig.json --noEmit",
+    "test": "node --test dist/server/tests/*.test.js",
+    "gen:codex-types": "codex app-server generate-ts --out server/src/codex/generated"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/ext-apps": "^1.0.1",
+    "@modelcontextprotocol/sdk": "^1.26.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "@types/react": "^19.1.0",
+    "@types/react-dom": "^19.1.0",
+    "@vitejs/plugin-react": "^4.4.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "typescript": "^5.8.3",
+    "vite": "^6.3.0",
+    "vite-plugin-singlefile": "^2.2.0"
+  }
+}

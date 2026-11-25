@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Cross-platform launcher for Duo-Team MCP Server.
+# Automatically finds Node.js >= 22.5 (required for built-in node:sqlite)
+# even when launched from GUI apps without shell PATH initialization.
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+ENTRY="${PLUGIN_ROOT}/dist/server/index.js"
+
+node_supports_sqlite() {
+  local bin="$1"
+  [ -x "$bin" ] || return 1
+  "$bin" -e 'const [maj, min] = process.versions.node.split(".").map(Number); process.exit(maj > 22 || (maj === 22 && min >= 5) ? 0 : 1);' >/dev/null 2>&1
+}
+
+find_node() {
+  local candidates=()
+  if command -v node >/dev/null 2>&1; then
+    candidates+=("$(command -v node)")
+  fi
+  candidates+=(
+    "/opt/homebrew/bin/node"
+    "/usr/local/bin/node"
+    "${HOME}/.volta/bin/node"
+    "${HOME}/.asdf/shims/node"
+    "${HOME}/.local/bin/node"
+    "/usr/bin/node"
+  )
+
+  # Check nvm / fnm installations (newest first)
+  if [ -d "${HOME}/.nvm/versions/node" ]; then
+    while IFS= read -r p; do
+      candidates+=("$p")
+    done < <(ls -1d "${HOME}/.nvm/versions/node"/v*/bin/node 2>/dev/null | sort -rV)
+  fi
+  if [ -d "${HOME}/.fnm/node-versions" ]; then
+    while IFS= read -r p; do
+      candidates+=("$p")
+    done < <(ls -1d "${HOME}/.fnm/node-versions"/v*/installation/bin/node 2>/dev/null | sort -rV)
+  fi
+
+  for bin in "${candidates[@]}"; do
+    if node_supports_sqlite "$bin"; then
+      echo "$bin"
+      return 0
+    fi
+  done
+  return 1
+}
+
+NODE_BIN="$(find_node || true)"
+if [ -z "$NODE_BIN" ]; then
+  echo "duo-team error: Node.js >= 22.5.0 (with built-in node:sqlite) is required but was not found." >&2
+  exit 1
+fi
+
+if [ ! -f "$ENTRY" ]; then
+  echo "duo-team error: Built server entry not found at ${ENTRY}. Run 'npm run build' first." >&2
+  exit 1
+fi
+
+exec "$NODE_BIN" "$ENTRY" "$@"

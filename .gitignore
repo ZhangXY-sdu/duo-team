@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.duo-team/
+server/src/codex/generated/
+.DS_Store
+*.log
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
