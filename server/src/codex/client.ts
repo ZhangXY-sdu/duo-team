@@ -46,6 +46,7 @@ export interface SubAgentInfo {
 
 export interface ThreadSnapshot {
   threadId: string;
+  projectId: string | null;
   role: string;
   taskId: string | null;
   cwd: string;
@@ -69,6 +70,7 @@ export interface ThreadSnapshot {
 export interface SpawnTaskOptions {
   prompt: string;
   cwd: string;
+  projectId?: string | null;
   role?: string;
   taskId?: string;
   model?: string;
@@ -620,6 +622,7 @@ export class CodexAppServerBridge {
   private toSnapshot(t: InternalThread): ThreadSnapshot {
     return {
       threadId: t.threadId,
+      projectId: t.projectId,
       role: t.role,
       taskId: t.taskId,
       cwd: t.cwd,
@@ -754,6 +757,7 @@ export class CodexAppServerBridge {
     const threadId = startRes.thread.id;
     const internal: InternalThread = {
       threadId,
+      projectId: opts.projectId ?? null,
       role: opts.role ?? "Codex Worker",
       taskId: opts.taskId ?? null,
       cwd: startRes.cwd ?? opts.cwd,
@@ -842,6 +846,7 @@ export class CodexAppServerBridge {
       if (!internal) {
         internal = {
           threadId: resumed.thread.id,
+          projectId: null,
           role: "Codex Worker (Resumed)",
           taskId: null,
           cwd: resumed.cwd ?? opts.cwd ?? process.cwd(),

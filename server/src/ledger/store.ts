@@ -95,6 +95,7 @@ export interface ProjectRecord {
   id: string;
   name: string;
   rootPath: string;
+  storageDir: string | null;
   mode: CollaborationMode;
   defaultCodexModel: string | null;
   defaultCodexEffort: string | null;
@@ -220,12 +221,15 @@ export class TeamLedger {
       CREATE TABLE IF NOT EXISTS projects (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
-        root_path TEXT NOT NULL UNIQUE,
+        root_path TEXT NOT NULL,
+        storage_dir TEXT,
         mode TEXT NOT NULL DEFAULT 'plan_execute',
         default_codex_model TEXT,
         default_codex_effort TEXT,
         lock_codex_model INTEGER NOT NULL DEFAULT 1,
         role_models_json TEXT NOT NULL DEFAULT '{}',
+        language TEXT NOT NULL DEFAULT 'zh-CN',
+        max_parallel_codex INTEGER NOT NULL DEFAULT 4,
         default_approval_policy TEXT NOT NULL DEFAULT 'on-request',
         max_reworks INTEGER NOT NULL DEFAULT 3,
         created_at TEXT NOT NULL,
@@ -256,6 +260,49 @@ export class TeamLedger {
     }
     if (!colNames.has("max_parallel_codex")) {
       this.registryDb.exec("ALTER TABLE projects ADD COLUMN max_parallel_codex INTEGER NOT NULL DEFAULT 4");
+    }
+    if (!colNames.has("storage_dir")) {
+      this.registryDb.exec("ALTER TABLE projects ADD COLUMN storage_dir TEXT");
+    }
+
+    // Drop legacy UNIQUE constraint on root_path so users can create multiple isolated topic projects in the same workspace
+    const tableSqlRow = this.registryDb
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'projects'")
+      .get() as { sql?: string } | undefined;
+    if (tableSqlRow?.sql && /root_path\s+TEXT\s+NOT\s+NULL\s+UNIQUE/i.test(tableSqlRow.sql)) {
+      this.registryDb.exec(`
+        BEGIN TRANSACTION;
+        CREATE TABLE projects_v2 (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          root_path TEXT NOT NULL,
+          storage_dir TEXT,
+          mode TEXT NOT NULL DEFAULT 'plan_execute',
+          default_codex_model TEXT,
+          default_codex_effort TEXT,
+          lock_codex_model INTEGER NOT NULL DEFAULT 1,
+          role_models_json TEXT NOT NULL DEFAULT '{}',
+          language TEXT NOT NULL DEFAULT 'zh-CN',
+          max_parallel_codex INTEGER NOT NULL DEFAULT 4,
+          default_approval_policy TEXT NOT NULL DEFAULT 'on-request',
+          max_reworks INTEGER NOT NULL DEFAULT 3,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        INSERT INTO projects_v2 (
+          id, name, root_path, storage_dir, mode, default_codex_model, default_codex_effort,
+          lock_codex_model, role_models_json, language, max_parallel_codex,
+          default_approval_policy, max_reworks, created_at, updated_at
+        )
+        SELECT
+          id, name, root_path, storage_dir, mode, default_codex_model, default_codex_effort,
+          lock_codex_model, role_models_json, language, max_parallel_codex,
+          default_approval_policy, max_reworks, created_at, updated_at
+        FROM projects;
+        DROP TABLE projects;
+        ALTER TABLE projects_v2 RENAME TO projects;
+        COMMIT;
+      `);
     }
 
     const gCols = this.registryDb.prepare("PRAGMA table_info(global_settings)").all() as Array<{ name: string }>;
@@ -410,6 +457,7 @@ export class TeamLedger {
       id: String(row.id),
       name: String(row.name),
       rootPath: String(row.root_path),
+      storageDir: row.storage_dir ? String(row.storage_dir) : null,
       mode: String(row.mode) as CollaborationMode,
       defaultCodexModel: row.default_codex_model ? String(row.default_codex_model) : null,
       defaultCodexEffort: row.default_codex_effort ? String(row.default_codex_effort) : null,
@@ -431,23 +479,52 @@ export class TeamLedger {
     return rows.map((r) => this.mapProject(r));
   }
 
+  public findProjectByPath(dirPath: string): ProjectRecord | null {
+    const resolved = path.resolve(dirPath);
+    const all = this.listProjects();
+    // 1. Exact root_path match (most recently updated if multiple isolated projects share the folder)
+    const exact = all.find((p) => p.rootPath === resolved);
+    if (exact) return exact;
+    // 2. Nearest ancestor root_path (e.g. git worktree or subfolder inside a registered project)
+    let best: ProjectRecord | null = null;
+    for (const p of all) {
+      const prefix = p.rootPath.endsWith(path.sep) ? p.rootPath : `${p.rootPath}${path.sep}`;
+      if (resolved.startsWith(prefix)) {
+        if (!best || p.rootPath.length > best.rootPath.length) {
+          best = p;
+        }
+      }
+    }
+    return best;
+  }
+
   public getProject(projectIdOrPath: string): ProjectRecord | null {
+    const trimmed = projectIdOrPath.trim();
+    if (!trimmed) return null;
     const byId = this.registryDb
       .prepare("SELECT * FROM projects WHERE id = ?")
-      .get(projectIdOrPath) as Record<string, unknown> | undefined;
+      .get(trimmed) as Record<string, unknown> | undefined;
     if (byId) return this.mapProject(byId);
 
-    const resolved = path.resolve(projectIdOrPath);
+    const resolved = path.resolve(trimmed);
     const byPath = this.registryDb
-      .prepare("SELECT * FROM projects WHERE root_path = ?")
+      .prepare("SELECT * FROM projects WHERE root_path = ? ORDER BY updated_at DESC LIMIT 1")
       .get(resolved) as Record<string, unknown> | undefined;
-    return byPath ? this.mapProject(byPath) : null;
+    if (byPath) return this.mapProject(byPath);
+
+    // Exact case-insensitive project name match (only when unique)
+    const byNameRows = this.registryDb
+      .prepare("SELECT * FROM projects WHERE lower(name) = lower(?)")
+      .all(trimmed) as Record<string, unknown>[];
+    if (byNameRows.length === 1) return this.mapProject(byNameRows[0]);
+    return null;
   }
 
   public ensureProject(
     rootPath: string,
     opts?: {
       name?: string;
+      forceNew?: boolean;
       mode?: CollaborationMode;
       defaultCodexModel?: string | null;
       defaultCodexEffort?: string | null;
@@ -464,19 +541,44 @@ export class TeamLedger {
       throw new Error(`项目目录不存在: ${resolved}`);
     }
 
-    const existing = this.getProject(resolved);
+    const samePathRows = this.registryDb
+      .prepare("SELECT * FROM projects WHERE root_path = ? ORDER BY updated_at DESC")
+      .all(resolved) as Record<string, unknown>[];
+    const samePathProjects = samePathRows.map((r) => this.mapProject(r));
+
     const ts = nowIso();
-    if (existing) {
-      if (opts && Object.keys(opts).length > 0) {
-        return this.updateProject(existing.id, opts);
+    const requestedName = opts?.name?.trim() || "";
+
+    if (!opts?.forceNew && samePathProjects.length > 0) {
+      // If a distinct project name is given in an already-used folder, isolate it as a separate project!
+      if (requestedName) {
+        const sameName = samePathProjects.find((p) => p.name.toLowerCase() === requestedName.toLowerCase());
+        if (sameName) {
+          const patch = { ...opts };
+          delete patch.forceNew;
+          if (Object.keys(patch).length > 0) return this.updateProject(sameName.id, patch);
+          this.getProjectDb(sameName);
+          return sameName;
+        }
+        // Different name in same folder -> fall through to create an isolated project!
+      } else {
+        const existing = samePathProjects[0];
+        const patch = { ...opts };
+        delete patch.forceNew;
+        if (Object.keys(patch).length > 0) return this.updateProject(existing.id, patch);
+        this.getProjectDb(existing);
+        return existing;
       }
-      this.getProjectDb(existing);
-      return existing;
     }
 
     const globalCfg = this.getGlobalSettings();
     const id = randomUUID().slice(0, 8);
-    const name = (opts?.name?.trim() || path.basename(resolved)) || "Project";
+    const name = requestedName || path.basename(resolved) || "Project";
+    // First project in a directory uses <rootPath>/.duo-team; additional isolated projects use <rootPath>/.duo-team/projects/<id>
+    const storageDir =
+      samePathProjects.length > 0 || opts?.forceNew
+        ? path.join(resolved, ".duo-team", "projects", id)
+        : null;
     const mode: CollaborationMode = opts?.mode ?? "plan_execute";
     const defaultCodexModel = opts?.defaultCodexModel !== undefined ? opts.defaultCodexModel : globalCfg.defaultCodexModel;
     const defaultCodexEffort = opts?.defaultCodexEffort !== undefined ? opts.defaultCodexEffort : globalCfg.defaultCodexEffort;
@@ -489,13 +591,14 @@ export class TeamLedger {
 
     this.registryDb
       .prepare(
-        `INSERT INTO projects (id, name, root_path, mode, default_codex_model, default_codex_effort, lock_codex_model, role_models_json, language, max_parallel_codex, default_approval_policy, max_reworks, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO projects (id, name, root_path, storage_dir, mode, default_codex_model, default_codex_effort, lock_codex_model, role_models_json, language, max_parallel_codex, default_approval_policy, max_reworks, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         id,
         name,
         resolved,
+        storageDir,
         mode,
         defaultCodexModel,
         defaultCodexEffort,
@@ -569,7 +672,7 @@ export class TeamLedger {
   }
 
   private teamDir(project: ProjectRecord): string {
-    return path.join(project.rootPath, ".duo-team");
+    return project.storageDir ? project.storageDir : path.join(project.rootPath, ".duo-team");
   }
 
   private getProjectDb(project: ProjectRecord): DatabaseSync {

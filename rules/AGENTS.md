@@ -3,7 +3,10 @@
 When working in a Duo-Team enabled project:
 
 1. **默认简体中文交流（Chinese-First Communication）**：除非用户明确要求英文或目标产物本身为英文论文/代码，Gemini 与 Codex 之间的一切协作消息、任务计划、评审意见、辩论立论与反驳、共享记忆（`memory.md`）以及对用户的汇报，**一律使用简体中文**（代码标识符、命令与原始英文文献引文保留原样）。
-2. **Single Source of Truth**：项目目标、已确认决策、方法口径与避坑记录统一维护在 `.duo-team/memory.md`（`team_memory`），所有委派任务写入项目账本（`team_task_upsert`）。
+2. **严格跨项目隔离铁律（Strict Project Isolation）**：
+   - 每开启一个新工作区或一个与当前已有项目无关的新主题（如「做 PPT」「新实验仓库」「另一篇论文」），**必须先调用 `team_project_init(rootPath=..., name=..., forceNew=true)`** 创建完全独立的项目账本与记忆；
+   - 后续所有 Duo-Team 工具调用（`team_task_upsert`、`team_message_post`、`team_memory_add`、`codex_spawn`、`codex_spawn_batch`、`codex_broadcast` 等）**必须显式传入该项目的 `project` ID**，绝不省略参数以免污染其他项目！
+3. **Single Source of Truth**：项目目标、已确认决策、方法口径与避坑记录统一维护在该项目专属的 `memory.md`（`team_memory` / `team_memory_add`），所有委派任务写入该项目账本（`team_task_upsert`）。
 3. **真实跨模型协作 & 支持并发多开 Subagent**：
    - 绝不自己角色扮演两家模型；始终通过 `codex_spawn` / `codex_spawn_batch` / `codex_wait` / `codex_message` 调用真实的本地 Codex 线程。
    - 复杂任务鼓励并发多开 Subagent：既可通过 `codex_spawn_batch` 一次拉起多个带独立角色/模型/推理档的 GPT Subagent，也可同时配合 Antigravity 原生 `invoke_subagent` / `run_workflow` 拉起 Gemini 子 Agent，并始终遵守用户在工作台设定的模型锁定与最大并行数限制。

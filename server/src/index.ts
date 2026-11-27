@@ -78,8 +78,12 @@ function loadWorkbenchHtml(): string {
   return `<!doctype html><html><body style="font-family:system-ui;padding:24px"><h2>Duo-Team Workbench UI 未构建</h2><p>请在 duo-team 目录运行 <code>npm run build:ui</code>。</p></body></html>`;
 }
 
-function resolveProjectId(ledger: TeamLedger, projectIdOrPath?: string): string {
-  if (projectIdOrPath) {
+function resolveProjectId(
+  ledger: TeamLedger,
+  projectIdOrPath?: string,
+  opts?: { cwd?: string }
+): string {
+  if (projectIdOrPath && projectIdOrPath.trim()) {
     const found = ledger.getProject(projectIdOrPath);
     if (found) return found.id;
     if (fs.existsSync(projectIdOrPath) && fs.statSync(projectIdOrPath).isDirectory()) {
@@ -87,8 +91,26 @@ function resolveProjectId(ledger: TeamLedger, projectIdOrPath?: string): string 
     }
     throw new Error(`找不到项目: ${projectIdOrPath}。请先调用 team_project_init 或传入有效的项目目录路径。`);
   }
+
+  if (opts?.cwd && opts.cwd.trim()) {
+    const matched = ledger.findProjectByPath(opts.cwd);
+    if (matched) return matched.id;
+    if (fs.existsSync(opts.cwd) && fs.statSync(opts.cwd).isDirectory()) {
+      return ledger.ensureProject(opts.cwd).id;
+    }
+  }
+
   const projects = ledger.listProjects();
-  if (projects.length > 0) return projects[0].id;
+  if (projects.length === 1) return projects[0].id;
+  if (projects.length > 1) {
+    const listText = projects
+      .slice(0, 8)
+      .map((p) => `- ${p.id}「${p.name}」(${p.rootPath})`)
+      .join("\n");
+    throw new Error(
+      `当前已注册 ${projects.length} 个项目，为防止跨项目串台，调用此工具时必须明确传入 project 参数（项目 ID 或目录路径），或先调用 team_project_init 创建/绑定独立项目。\n已注册项目：\n${listText}`
+    );
+  }
   throw new Error("尚未注册任何 Duo-Team 项目。请先调用 team_project_init 指定项目目录。");
 }
 
@@ -226,6 +248,17 @@ export function createDuoTeamServer(options: {
     });
     const quotaRemaining = subscriptionProfile.chatgpt.quota.effectiveRemainingPercent;
 
+    const resolveThreadProjectId = (t: ThreadSnapshot): string | null => {
+      if (t.projectId) return t.projectId;
+      const mapped = threadProjectMap.get(t.threadId);
+      if (mapped) return mapped;
+      if (t.cwd) {
+        const matched = ledger.findProjectByPath(t.cwd);
+        if (matched) return matched.id;
+      }
+      return null;
+    };
+
     if (!activeProject) {
       const schedule = analyzeSchedule({
         project: null,
@@ -249,16 +282,41 @@ export function createDuoTeamServer(options: {
         pinnedFiles: [],
         workflowPresets: [],
         schedule,
-        codex: codexStatus,
+        codex: {
+          ...codexStatus,
+          otherProjectsThreads: [],
+          otherProjectsApprovalCount: 0,
+        },
       };
     }
+
+    const projectNameMap = new Map(projects.map((p) => [p.id, p.name]));
+    const projectThreads: ThreadSnapshot[] = [];
+    const otherProjectsThreads: Array<{ threadId: string; projectId: string | null; projectName: string; role: string; status: string }> = [];
+    for (const t of codexStatus.activeThreads) {
+      const ownerPid = resolveThreadProjectId(t);
+      if (ownerPid === activeProject.id) {
+        projectThreads.push(t);
+      } else {
+        otherProjectsThreads.push({
+          threadId: t.threadId,
+          projectId: ownerPid,
+          projectName: (ownerPid && projectNameMap.get(ownerPid)) || path.basename(t.cwd || "") || "未归属项目",
+          role: t.role,
+          status: t.status,
+        });
+      }
+    }
+    const projectThreadIds = new Set(projectThreads.map((t) => t.threadId));
+    const projectApprovals = codexStatus.pendingApprovals.filter((a) => projectThreadIds.has(a.threadId));
+    const otherProjectsApprovalCount = codexStatus.pendingApprovals.length - projectApprovals.length;
 
     const tasks = ledger.listTasks(activeProject.id);
     const schedule = analyzeSchedule({
       project: activeProject,
       globalSettings,
       tasks,
-      activeThreads: codexStatus.activeThreads,
+      activeThreads: projectThreads,
       availableModels: normalizedModels,
       quotaRemainingPercent: quotaRemaining,
       subscriptionProfile,
@@ -277,7 +335,13 @@ export function createDuoTeamServer(options: {
       pinnedFiles: ledger.listPinnedFiles(activeProject.id),
       workflowPresets: ledger.listWorkflowPresets(activeProject.id),
       schedule,
-      codex: codexStatus,
+      codex: {
+        ...codexStatus,
+        activeThreads: projectThreads,
+        pendingApprovals: projectApprovals,
+        otherProjectsThreads,
+        otherProjectsApprovalCount,
+      },
     };
   }
 
@@ -371,17 +435,13 @@ export function createDuoTeamServer(options: {
       let projectId: string | null = null;
       let effectiveCwd = args.cwd;
 
-      if (args.project || (!effectiveCwd && ledger.listProjects().length > 0)) {
-        try {
-          projectId = resolveProjectId(ledger, args.project);
-          const proj = ledger.getProject(projectId)!;
-          if (!effectiveCwd) effectiveCwd = proj.rootPath;
-          if (args.createWorktree && args.taskId) {
-            const wt = ledger.ensureWorktree(projectId, args.taskId);
-            effectiveCwd = wt.worktreePath;
-          }
-        } catch {
-          // Allow standalone cwd invocation even without registered project
+      if (args.project || effectiveCwd || ledger.listProjects().length > 0) {
+        projectId = resolveProjectId(ledger, args.project, { cwd: effectiveCwd });
+        const proj = ledger.getProject(projectId)!;
+        if (!effectiveCwd) effectiveCwd = proj.rootPath;
+        if (args.createWorktree && args.taskId) {
+          const wt = ledger.ensureWorktree(projectId, args.taskId);
+          effectiveCwd = wt.worktreePath;
         }
       }
 
@@ -400,6 +460,7 @@ export function createDuoTeamServer(options: {
       const snap = await bridge.spawnTask({
         prompt: args.prompt,
         cwd: path.resolve(effectiveCwd),
+        projectId,
         role: args.role ?? "Codex Worker",
         taskId: args.taskId,
         model: resolvedCfg.model,
@@ -481,14 +542,11 @@ export function createDuoTeamServer(options: {
     async (args) => {
       let projectId: string | null = null;
       let baseCwd = args.cwd;
-      if (args.project || (!baseCwd && ledger.listProjects().length > 0)) {
-        try {
-          projectId = resolveProjectId(ledger, args.project);
-          const proj = ledger.getProject(projectId)!;
-          if (!baseCwd) baseCwd = proj.rootPath;
-        } catch {
-          // allow standalone cwd
-        }
+      const firstAgentCwd = args.agents.find((a) => a.cwd)?.cwd;
+      if (args.project || baseCwd || firstAgentCwd || ledger.listProjects().length > 0) {
+        projectId = resolveProjectId(ledger, args.project, { cwd: baseCwd ?? firstAgentCwd });
+        const proj = ledger.getProject(projectId)!;
+        if (!baseCwd) baseCwd = proj.rootPath;
       }
 
       const globalCfg = ledger.getGlobalSettings();
@@ -504,14 +562,18 @@ export function createDuoTeamServer(options: {
       const launched = await Promise.all(
         args.agents.map(async (item) => {
           let itemCwd = item.cwd ?? baseCwd;
-          if (item.createWorktree && projectId && item.taskId) {
-            const wt = ledger.ensureWorktree(projectId, item.taskId);
+          const itemProjectId =
+            item.cwd && !args.project
+              ? resolveProjectId(ledger, undefined, { cwd: item.cwd })
+              : projectId;
+          if (item.createWorktree && itemProjectId && item.taskId) {
+            const wt = ledger.ensureWorktree(itemProjectId, item.taskId);
             itemCwd = wt.worktreePath;
           }
           if (!itemCwd) throw new Error(`Subagent「${item.role}」缺少工作目录 cwd。`);
 
           const resolvedCfg = ledger.resolveCodexConfig({
-            projectId,
+            projectId: itemProjectId,
             role: item.role,
             requestedModel: item.model,
             requestedEffort: item.effort,
@@ -522,6 +584,7 @@ export function createDuoTeamServer(options: {
           const snap = await bridge.spawnTask({
             prompt: item.prompt,
             cwd: path.resolve(itemCwd),
+            projectId: itemProjectId,
             role: item.role,
             taskId: item.taskId,
             model: effectiveModel,
@@ -532,9 +595,9 @@ export function createDuoTeamServer(options: {
             async: true,
           });
 
-          if (projectId) {
-            threadProjectMap.set(snap.threadId, projectId);
-            ledger.saveRun(projectId, {
+          if (itemProjectId) {
+            threadProjectMap.set(snap.threadId, itemProjectId);
+            ledger.saveRun(itemProjectId, {
               threadId: snap.threadId,
               taskId: snap.taskId,
               role: snap.role,
@@ -546,8 +609,8 @@ export function createDuoTeamServer(options: {
               finalOutput: snap.latestOutput.slice(-8000),
               updatedAt: snap.updatedAt,
             });
-            if (item.taskId && ledger.getTask(projectId, item.taskId)) {
-              ledger.updateTask(projectId, item.taskId, {
+            if (item.taskId && ledger.getTask(itemProjectId, item.taskId)) {
+              ledger.updateTask(itemProjectId, item.taskId, {
                 codexThreadId: snap.threadId,
                 status: "running",
               });
@@ -575,18 +638,40 @@ export function createDuoTeamServer(options: {
   server.registerTool(
     "codex_broadcast",
     {
-      title: "Broadcast Message or Interrupt All Codex Subagents",
-      description: "Send a steering/follow-up instruction to multiple or all active Codex subagents simultaneously, or interrupt all running subagents at once.",
+      title: "Broadcast Message or Interrupt Project Codex Subagents",
+      description: "Send a steering/follow-up instruction to multiple or all active Codex subagents in the target project, or interrupt all running subagents in that project without affecting other projects.",
       inputSchema: {
         action: z.enum(["message", "interrupt_all"]),
+        project: z.string().optional().describe("Project ID or path to scope the broadcast/interrupt strictly to that project's threads."),
         text: z.string().optional().describe("Required when action='message'."),
-        threadIds: z.array(z.string()).optional().describe("Optional subset of thread IDs; omit to target all active threads."),
+        threadIds: z.array(z.string()).optional().describe("Optional explicit subset of thread IDs."),
       },
       _meta: { ui: { visibility: ["model", "app"] } },
     },
-    async ({ action, text, threadIds }) => {
+    async ({ action, project, text, threadIds }) => {
+      let scopedIds = threadIds;
+      if (!scopedIds && project) {
+        const pid = resolveProjectId(ledger, project);
+        scopedIds = bridge
+          .listThreads()
+          .filter((t) => (t.projectId ?? threadProjectMap.get(t.threadId) ?? ledger.findProjectByPath(t.cwd)?.id ?? null) === pid)
+          .map((t) => t.threadId);
+      }
+
       if (action === "interrupt_all") {
-        const interrupted = await bridge.interruptAll();
+        let interrupted: ThreadSnapshot[];
+        if (scopedIds) {
+          const runningSet = new Set(
+            bridge
+              .listThreads()
+              .filter((t) => scopedIds!.includes(t.threadId) && (t.status === "running" || t.status === "waiting_approval"))
+              .map((t) => t.threadId)
+          );
+          const settled = await Promise.all([...runningSet].map((id) => bridge.interrupt(id)));
+          interrupted = settled.filter((s): s is ThreadSnapshot => Boolean(s));
+        } else {
+          interrupted = await bridge.interruptAll();
+        }
         const payload = { interruptedCount: interrupted.length, threads: interrupted };
         return {
           content: [{ type: "text", text: summarizeText(payload) }],
@@ -594,7 +679,7 @@ export function createDuoTeamServer(options: {
         };
       }
       if (!text || !text.trim()) throw new Error("广播消息时必须提供 text 内容");
-      const deliveries = await bridge.broadcastMessage(text.trim(), threadIds);
+      const deliveries = await bridge.broadcastMessage(text.trim(), scopedIds);
       const payload = { deliveries };
       return {
         content: [{ type: "text", text: summarizeText(payload) }],
@@ -698,12 +783,13 @@ export function createDuoTeamServer(options: {
   server.registerTool(
     "team_project_init",
     {
-      title: "Initialize or Switch Duo-Team Project",
+      title: "Initialize or Create Isolated Duo-Team Project",
       description:
-        "Register or update a real workspace directory for Duo-Team collaboration. Creates .duo-team/ledger.sqlite and shared memory.md directly inside the project root without relocating user files.",
+        "Register or create an isolated Duo-Team project for a workspace directory. If a different name is supplied or forceNew=true, creates a completely isolated ledger/memory inside .duo-team/projects/<id>/ even within the same folder so unrelated topics (e.g. a PPT contest vs. a research paper) never mix.",
       inputSchema: {
         rootPath: z.string().min(1).describe("Absolute path of the real project folder (code, paper, research data, etc.)."),
-        name: z.string().optional(),
+        name: z.string().optional().describe("Distinct project name (supplying a new name in an existing folder automatically creates an isolated project)."),
+        forceNew: z.boolean().optional().describe("Force creating a brand-new isolated project ledger even in a directory that already has projects."),
         mode: z.enum(["plan_execute", "co_create", "parallel_research", "debate", "autonomous_team", "custom"]).optional(),
         defaultCodexModel: z.string().nullable().optional(),
         defaultCodexEffort: EFFORT_SCHEMA.nullable().optional(),
@@ -717,6 +803,7 @@ export function createDuoTeamServer(options: {
     async (args) => {
       const project = ledger.ensureProject(args.rootPath, {
         name: args.name,
+        forceNew: args.forceNew,
         mode: args.mode as CollaborationMode | undefined,
         defaultCodexModel: args.defaultCodexModel,
         defaultCodexEffort: args.defaultCodexEffort,
@@ -726,9 +813,10 @@ export function createDuoTeamServer(options: {
         maxReworks: args.maxReworks,
       });
       const memory = ledger.readMemory(project.id);
+      const dashboard = await buildDashboardPayload(project.id, false);
       return {
         content: [{ type: "text", text: summarizeText({ project, memoryPath: memory.path }) }],
-        structuredContent: { project, memoryPath: memory.path },
+        structuredContent: { project, memoryPath: memory.path, dashboard } as unknown as Record<string, unknown>,
       };
     }
   );
@@ -1210,6 +1298,7 @@ export function createDuoTeamServer(options: {
           const snap = await bridge.spawnTask({
             prompt,
             cwd,
+            projectId: pid,
             role: `${task.id} · ${task.title.slice(0, 24)}`,
             taskId: task.id,
             model: resolvedCfg.model,

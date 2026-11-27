@@ -16,7 +16,7 @@ You have direct access to the **Duo-Team MCP Bridge** (`duo-team_bridge`), which
 ## Preflight (Always Do First)
 
 1. **语言约定**：除非用户明确要求英文，所有跨模型消息（`team_message_post`）、给 Codex 的 prompt、任务说明、辩论和评审意见均**默认使用简体中文**。
-2. Call `team_project_init` on the user's real workspace directory (never relocate their files), call `team_project_map` to instantly grasp the repository/research outline and user-pinned focus files, and call `team_memory_search` to load confirmed decisions and anti-loop pitfalls.
+2. **严格项目隔离（防串台）**：先对当前真实工作区调用 `team_project_init(rootPath=..., name=...)`（如果要在同一文件夹下开一个完全独立的新话题，如做 PPT 与实证研究分开，务必传不同的 `name` 或 `forceNew=true` 创建独立账本）。记住返回的 `project.id`，后续**每一次**工具调用（建任务、发消息、写记忆、启动 Codex、全体广播）**必须显式传入 `project`**！然后调用 `team_project_map` 和 `team_memory_search` 加载该项目上下文。
 3. Call `codex_status` once at session start to verify Codex is connected, inspect the resolved `subscriptionProfile` (Google tier × auto-detected ChatGPT tier, primary & secondary rate-limit windows, and pairing advice), real available models/efforts, user model lock, and `maxParallelCodex`. Adapt delegation intensity to the pairing (e.g., on **Google AI Ultra + ChatGPT Plus**, let Gemini handle heavy synthesis/parallel subagents and conserve Codex Plus quota for core coding & critical cross-review).
 4. After major decisions, bug resolutions, or methodology agreements, persist them via `team_memory_add` (`decision` / `pitfall` / `fact` / `convention`, setting `pinned: true` for core constraints) so both Gemini and Codex never repeat mistakes.
 5. Optionally call `open_workbench` so the user can watch the live task board, project tree, memory, debate stream, and all running Codex subagents in the Antigravity side pane.

@@ -147,6 +147,7 @@ test("TeamLedger: project init, DAG dependencies, memory, messages, model locks,
       activeThreads: [
         {
           threadId: "thr_stalled",
+          projectId: null,
           role: "Stalled Worker",
           taskId: "T2",
           cwd: projDir,

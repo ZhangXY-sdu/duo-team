@@ -77,6 +77,7 @@ interface ProjectRecord extends GlobalModelSettings {
   id: string;
   name: string;
   rootPath: string;
+  storageDir?: string | null;
   mode: string;
   maxReworks: number;
 }
@@ -278,6 +279,14 @@ interface DashboardState {
     models: Array<Record<string, unknown>>;
     activeThreads: ThreadSnapshot[];
     pendingApprovals: PendingApproval[];
+    otherProjectsThreads?: Array<{
+      threadId: string;
+      projectId: string | null;
+      projectName: string;
+      role: string;
+      status: string;
+    }>;
+    otherProjectsApprovalCount?: number;
     errors: string[];
   };
   initialTab?: TabKey;
@@ -520,11 +529,27 @@ const IconPin = () => (
 );
 
 const MEM_CAT_LABELS: Record<MemoryItemRecord["category"], string> = {
-  decision: "核心决策",
-  pitfall: "避坑防循环",
-  fact: "事实口径",
-  convention: "项目规范",
+  decision: "已定方案",
+  pitfall: "踩过的坑",
+  fact: "数据口径",
+  convention: "约定规则",
 };
+
+function summarizeProjectFiles(byExtension?: Record<string, number>) {
+  const counts = { code: 0, doc: 0, data: 0, other: 0 };
+  if (!byExtension) return counts;
+  const codeExts = new Set([".ts", ".tsx", ".js", ".jsx", ".py", ".r", ".do", ".ado", ".go", ".rs", ".java", ".cpp", ".c", ".sh", ".sql", ".css", ".html"]);
+  const docExts = new Set([".md", ".tex", ".txt", ".pdf", ".docx", ".doc", ".pptx", ".ppt", ".rtf", ".qmd", ".rmd"]);
+  const dataExts = new Set([".csv", ".tsv", ".xlsx", ".xls", ".parquet", ".dta", ".rds", ".sav", ".json", ".yaml", ".yml"]);
+  for (const [ext, n] of Object.entries(byExtension)) {
+    const lower = ext.toLowerCase();
+    if (codeExts.has(lower)) counts.code += n;
+    else if (docExts.has(lower)) counts.doc += n;
+    else if (dataExts.has(lower)) counts.data += n;
+    else counts.other += n;
+  }
+  return counts;
+}
 
 function filterTreeNodes(nodes: ProjectTreeNode[], q: string): ProjectTreeNode[] {
   if (!q) return nodes;
@@ -584,6 +609,13 @@ export function AppView() {
   const [resumeInputs, setResumeInputs] = useState<Record<string, string>>({});
   const [memoryDraft, setMemoryDraft] = useState("");
   const [newProjectPath, setNewProjectPath] = useState("");
+  const [newProjectName, setNewProjectName] = useState("");
+  const [newProjectForceNew, setNewProjectForceNew] = useState(true);
+  const [showNewProjectDrawer, setShowNewProjectDrawer] = useState(false);
+  const [expandedThreads, setExpandedThreads] = useState<Record<string, boolean>>({});
+  const [feedNewestFirst, setFeedNewestFirst] = useState(true);
+  const syncInFlightRef = useRef(false);
+  const reqSeqRef = useRef(0);
   const [customModelId, setCustomModelId] = useState("");
   const [showCustomModel, setShowCustomModel] = useState(false);
   const [showSquadDrawer, setShowSquadDrawer] = useState(false);
@@ -732,53 +764,109 @@ export function AppView() {
   const schedule = state?.schedule ?? null;
   const pendingApprovals = state?.codex.pendingApprovals ?? [];
   const activeThreads = state?.codex.activeThreads ?? [];
+  const sortedActiveThreads = useMemo(() => {
+    const rank = (status: string) =>
+      status === "waiting_approval" ? 0 : status === "running" ? 1 : 2;
+    return [...activeThreads].sort((a, b) => {
+      const ra = rank(a.status);
+      const rb = rank(b.status);
+      if (ra !== rb) return ra - rb;
+      return Date.parse(b.updatedAt || "") - Date.parse(a.updatedAt || "");
+    });
+  }, [activeThreads]);
+  const otherProjectsThreads = state?.codex.otherProjectsThreads ?? [];
+  const otherProjectsApprovalCount = state?.codex.otherProjectsApprovalCount ?? 0;
   const runningCount = activeThreads.filter((t) => t.status === "running").length;
 
   const historicalRuns = useMemo(() => {
     const activeIds = new Set(activeThreads.map((t) => t.threadId));
-    return (state?.runs ?? []).filter((r) => !activeIds.has(r.threadId));
+    return [...(state?.runs ?? [])]
+      .filter((r) => !activeIds.has(r.threadId))
+      .sort((a, b) => Date.parse(b.updatedAt || "") - Date.parse(a.updatedAt || ""));
   }, [state?.runs, activeThreads]);
 
+  const sortedMessages = useMemo(() => {
+    const list = state?.messages ?? [];
+    return feedNewestFirst ? [...list].reverse() : list;
+  }, [state?.messages, feedNewestFirst]);
+
   const dualSideMessages = useMemo(() => {
-    const msgs = state?.messages ?? [];
+    const msgs = sortedMessages;
     const left = msgs.filter((m) => m.side === "pro" || m.side === "branch_a");
     const right = msgs.filter((m) => m.side === "con" || m.side === "branch_b");
     return { hasSides: left.length > 0 || right.length > 0, left, right };
-  }, [state?.messages]);
+  }, [sortedMessages]);
 
-  // Smart 3s live polling when active subagents or approvals exist
+  // Dual-speed continuous silent sync: 1.2s when running/pending approval, 3s when idle, plus instant sync on focus/tab switch
   useEffect(() => {
-    if (!autoSync || (runningCount === 0 && pendingApprovals.length === 0)) return;
-    const timer = setInterval(() => {
+    if (!autoSync) return;
+    const intervalMs = runningCount > 0 || pendingApprovals.length > 0 ? 1200 : 3000;
+    const silentSync = () => {
       const app = appRef.current;
-      if (!app) return;
+      if (!app || syncInFlightRef.current) return;
+      syncInFlightRef.current = true;
+      const mySeq = reqSeqRef.current;
       app
         .callServerTool({
           name: "ui_dashboard_state",
           arguments: { project: activeProject?.id, includeCodexStatus: false },
         })
         .then((res) => {
+          if (mySeq !== reqSeqRef.current) return;
           const sc = res.structuredContent as DashboardState | undefined;
           if (sc) setState(sc);
         })
-        .catch(() => undefined);
-    }, 3000);
-    return () => clearInterval(timer);
+        .catch(() => undefined)
+        .finally(() => {
+          syncInFlightRef.current = false;
+        });
+    };
+
+    const timer = setInterval(silentSync, intervalMs);
+    const onFocusOrVisible = () => {
+      if (typeof document === "undefined" || document.visibilityState !== "hidden") {
+        silentSync();
+      }
+    };
+    window.addEventListener("focus", onFocusOrVisible);
+    document.addEventListener("visibilitychange", onFocusOrVisible);
+    return () => {
+      clearInterval(timer);
+      window.removeEventListener("focus", onFocusOrVisible);
+      document.removeEventListener("visibilitychange", onFocusOrVisible);
+    };
   }, [autoSync, runningCount, pendingApprovals.length, activeProject?.id]);
 
   useEffect(() => {
     if (tab === "artifacts") inspectWorkspace(activeProject?.id);
+    if (autoSync && appRef.current && !syncInFlightRef.current) {
+      const mySeq = reqSeqRef.current;
+      appRef.current
+        .callServerTool({
+          name: "ui_dashboard_state",
+          arguments: { project: activeProject?.id, includeCodexStatus: false },
+        })
+        .then((res) => {
+          if (mySeq !== reqSeqRef.current) return;
+          const sc = res.structuredContent as DashboardState | undefined;
+          if (sc) setState(sc);
+        })
+        .catch(() => undefined);
+    }
   }, [tab, activeProject?.id]);
 
   async function refresh(project?: string, includeCodexStatus = false, restartCodex = false) {
     const app = appRef.current;
     if (!app) return;
+    reqSeqRef.current += 1;
+    const mySeq = reqSeqRef.current;
     setLoading(true);
     try {
       const res = await app.callServerTool({
         name: "ui_dashboard_state",
         arguments: { project: project ?? activeProject?.id, includeCodexStatus, restartCodex },
       });
+      if (mySeq !== reqSeqRef.current) return;
       const sc = res.structuredContent as DashboardState | undefined;
       if (sc) {
         setState(sc);
@@ -932,18 +1020,38 @@ export function AppView() {
     }
   }
 
-  async function initProjectFromUi() {
+  async function initProjectFromUi(override?: { rootPath?: string; name?: string; forceNew?: boolean }) {
     const app = appRef.current;
-    if (!app || !newProjectPath.trim()) return;
-    const target = newProjectPath.trim();
+    const target = (override?.rootPath ?? newProjectPath).trim();
+    if (!app || !target) return;
+    const name = (override?.name ?? newProjectName).trim();
+    const forceNew = override?.forceNew ?? newProjectForceNew;
+    reqSeqRef.current += 1;
     setLoading(true);
     try {
-      await app.callServerTool({ name: "team_project_init", arguments: { rootPath: target } });
+      const res = await app.callServerTool({
+        name: "team_project_init",
+        arguments: {
+          rootPath: target,
+          name: name || undefined,
+          forceNew,
+        },
+      });
+      const sc = res.structuredContent as { project?: ProjectRecord; dashboard?: DashboardState } | undefined;
+      if (sc?.dashboard) {
+        setState(sc.dashboard);
+        setMemoryDraft(sc.dashboard.memory?.content ?? "");
+      } else if (sc?.project?.id) {
+        await refresh(sc.project.id, false);
+      } else {
+        await refresh(target, false);
+      }
       setNewProjectPath("");
-      await refresh(target, false);
-      setNotice("已绑定项目目录并初始化 .duo-team/");
+      setNewProjectName("");
+      setShowNewProjectDrawer(false);
+      setNotice(`已创建并切换至独立项目「${sc?.project?.name ?? (name || target)}」（与其他项目完全隔离）`);
     } catch (err) {
-      setNotice(`初始化失败: ${err instanceof Error ? err.message : String(err)}`);
+      setNotice(`新建项目失败: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
       setLoading(false);
     }
@@ -1019,7 +1127,10 @@ export function AppView() {
     try {
       await app.callServerTool({
         name: "codex_broadcast",
-        arguments: action === "message" ? { action, text: broadcastInput.trim() } : { action },
+        arguments:
+          action === "message"
+            ? { action, project: activeProject?.id, text: broadcastInput.trim() }
+            : { action, project: activeProject?.id },
       });
       if (action === "message") setBroadcastInput("");
       await refresh();
@@ -1485,7 +1596,7 @@ export function AppView() {
     { key: "board", label: "智能调度看板", count: state?.tasks.length ?? 0 },
     { key: "workers", label: "GPT 编队", count: runningCount > 0 ? `${runningCount} 运行中` : activeThreads.length },
     { key: "feed", label: "协作与辩论", count: state?.messages.length ?? 0 },
-    { key: "artifacts", label: "项目树与记忆", count: state?.memoryItems?.length ?? 0 },
+    { key: "artifacts", label: "文件与备忘", count: state?.memoryItems?.length ?? 0 },
   ];
 
   const pinnedSet = useMemo(() => new Set((state?.pinnedFiles ?? wsInspect?.pinnedFiles ?? []).map((f) => f.relPath)), [state?.pinnedFiles, wsInspect?.pinnedFiles]);
@@ -1546,9 +1657,9 @@ export function AppView() {
                   className={`btn sm ${isPinned ? "primary" : "ghost"}`}
                   style={{ padding: "2px 7px", fontSize: 11 }}
                   onClick={() => togglePinFile(node.path, isPinned)}
-                  title={isPinned ? "取消焦点挂载" : "挂载为 Gemini & Codex 共享焦点文件"}
+                  title={isPinned ? "取消双模型必读" : "设为必读：Gemini 和 GPT 每次干活都会优先看它"}
                 >
-                  <IconPin /> {isPinned ? "已挂载" : "挂载"}
+                  <IconPin /> {isPinned ? "必读" : "设为必读"}
                 </button>
               </>
             )}
@@ -1581,10 +1692,25 @@ export function AppView() {
                 style={{ marginLeft: 4 }}
               >
                 {state.projects.map((p) => (
-                  <option key={p.id} value={p.id}>{p.name}</option>
+                  <option key={p.id} value={p.id}>
+                    {p.name}{p.storageDir ? " (独立)" : ""}
+                  </option>
                 ))}
               </select>
             )}
+            <button
+              type="button"
+              className={`btn sm ${showNewProjectDrawer ? "primary" : "ghost"}`}
+              onClick={() => {
+                if (!showNewProjectDrawer && !newProjectPath && activeProject?.rootPath) {
+                  setNewProjectPath(activeProject.rootPath);
+                }
+                setShowNewProjectDrawer((v) => !v);
+              }}
+              title="新建完全隔离的独立项目（支持新文件夹，也支持同文件夹下按主题拆分）"
+            >
+              {showNewProjectDrawer ? "收起" : "+ 新建项目"}
+            </button>
           </div>
 
           <div className="row">
@@ -1609,14 +1735,58 @@ export function AppView() {
             <button
               className="btn sm ghost"
               onClick={() => setAutoSync((v) => !v)}
-              title="有线程运行时每 3 秒自动同步"
+              title="运行中每 1.2 秒实时刷新，空闲每 3 秒静默同步，切回窗口立刻更新"
             >
               <span className={`dot ${autoSync && runningCount > 0 ? "pulse" : ""}`} style={{ color: autoSync ? "var(--emerald)" : "var(--text-faint)" }} />
-              <span>{autoSync ? (runningCount > 0 ? "实时同步" : "自动同步") : "已暂停"}</span>
+              <span>{autoSync ? (runningCount > 0 ? "1.2s 实时" : "3s 自动") : "已暂停"}</span>
             </button>
             <button className="btn sm" onClick={() => refresh(undefined, true)} disabled={loading}>
               <IconRefresh spinning={loading} />
             </button>
+          </div>
+        </div>
+
+        <div className={`drawer ${showNewProjectDrawer ? "open" : ""}`}>
+          <div className="drawer-inner">
+            <div className="card subtle" style={{ padding: "10px 12px", marginTop: 4 }}>
+              <div className="row-between">
+                <span style={{ fontWeight: 620, fontSize: 12.5 }}>新建独立隔离项目（任务、GPT 线程与记忆完全分开，互不串台）</span>
+                <span className="muted" style={{ fontSize: 11 }}>可填新目录，也可沿用同目录按项目名拆分</span>
+              </div>
+              <div className="row">
+                <input
+                  type="text"
+                  style={{ flex: 1, minWidth: 150 }}
+                  placeholder="项目名称（如：提案大赛 PPT / Qwen 实验）"
+                  value={newProjectName}
+                  onChange={(e) => setNewProjectName(e.target.value)}
+                />
+                <input
+                  type="text"
+                  style={{ flex: 2, minWidth: 210 }}
+                  placeholder="文件夹绝对路径（如 /Users/you/Documents/Qwen）"
+                  value={newProjectPath}
+                  onChange={(e) => setNewProjectPath(e.target.value)}
+                />
+                <button
+                  type="button"
+                  className="switch"
+                  onClick={() => setNewProjectForceNew((v) => !v)}
+                  title="开启后即使路径与已有项目相同，也会建立全新独立账本"
+                >
+                  <span className={`switch-track ${newProjectForceNew ? "on" : ""}`}><span className="switch-thumb" /></span>
+                  <span>独立账本</span>
+                </button>
+                <button
+                  type="button"
+                  className="btn sm primary"
+                  disabled={loading || !newProjectPath.trim()}
+                  onClick={() => initProjectFromUi()}
+                >
+                  创建并切换
+                </button>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -2180,7 +2350,7 @@ export function AppView() {
                     value={newProjectPath}
                     onChange={(e) => setNewProjectPath(e.target.value)}
                   />
-                  <button className="btn primary" onClick={initProjectFromUi} disabled={loading || !newProjectPath.trim()}>
+                  <button className="btn primary" onClick={() => initProjectFromUi()} disabled={loading || !newProjectPath.trim()}>
                     初始化
                   </button>
                 </div>
@@ -2507,37 +2677,51 @@ export function AppView() {
                     </div>
                   )}
 
-                  {/* Visual DAG Wave Topology Flow */}
+                  {/* Plain-Chinese Visual Execution Flow */}
                 {schedule && schedule.waves.length > 0 && (
                   <div className="card stagger" style={{ "--i": 0 } as React.CSSProperties}>
                     <div className="row-between">
-                      <div className="row">
-                        <span className="section-title">DAG 拓扑波次流</span>
-                        <span className="pill gemini">关键路径：{schedule.criticalPath.join(" → ") || "无"}</span>
+                      <div>
+                        <div className="section-title">执行顺序流程图（从左到右按批次推进）</div>
+                        <div className="muted">同一列里的任务会 <strong>同时并行做</strong>，箭头指向的下一批会等前面全部完成后自动启动；紫色边框是最关键主线。</div>
                       </div>
-                      <span className="muted">
-                        已完成 {schedule.doneTasks}/{schedule.totalTasks} · 就绪 {schedule.readyTasks.length}
+                      <span className="muted" style={{ fontWeight: 600 }}>
+                        进度 {schedule.doneTasks}/{schedule.totalTasks} · 当前可启动 {schedule.readyTasks.length}
                       </span>
+                    </div>
+                    <div className="row" style={{ fontSize: 11.5 }}>
+                      <span className="pill running"><span className="dot pulse" />进行中</span>
+                      <span className="pill done">已完成</span>
+                      <span className="pill todo">待开始</span>
+                      <span className="pill awaiting_human">等你拍板</span>
+                      <span className="pill gemini">⭐ 核心主线：{schedule.criticalPath.join(" → ") || "无"}</span>
                     </div>
                     <div className="dag-strip">
                       {schedule.waves.map((w, idx) => (
                         <React.Fragment key={w.wave}>
                           <div className="dag-wave">
                             <div className="dag-wave-head">
-                              <span>Wave {w.wave}</span>
-                              <span>{w.taskIds.length} 任务</span>
+                              <span>第 {w.wave} 批{w.taskIds.length > 1 ? "（同时做）" : ""}</span>
+                              <span>{w.taskIds.length} 项</span>
                             </div>
                             {w.taskIds.map((tid) => {
                               const t = taskMap.get(tid);
                               if (!t) return null;
+                              const isCrit = criticalSet.has(tid);
                               return (
-                                <div key={tid} className={`dag-node ${criticalSet.has(tid) ? "critical" : ""}`}>
+                                <div key={tid} className={`dag-node ${isCrit ? "critical" : ""}`} title={`${tid} · ${t.title}（执行：${t.owner}）`}>
                                   <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                                    <strong>{tid}</strong> {t.title}
+                                    {isCrit ? "⭐ " : ""}
+                                    <strong>{t.title}</strong>
                                   </span>
-                                  <span className={`pill ${t.status}`} style={{ flexShrink: 0 }}>
-                                    {STATUS_LABELS[t.status] ?? t.status}
-                                  </span>
+                                  <div className="row" style={{ gap: 4, flexShrink: 0 }}>
+                                    <span className={`pill ${t.owner}`} style={{ fontSize: 10 }}>
+                                      {t.owner === "codex" ? "GPT" : t.owner === "gemini" ? "Gemini" : "人工"}
+                                    </span>
+                                    <span className={`pill ${t.status}`} style={{ fontSize: 10 }}>
+                                      {STATUS_LABELS[t.status] ?? t.status}
+                                    </span>
+                                  </div>
                                 </div>
                               );
                             })}
@@ -2689,13 +2873,38 @@ export function AppView() {
 
             <div className="row-between">
               <div className="row">
-                <span className="section-title">活跃 GPT 线程 ({activeThreads.length})</span>
+                <span className="section-title">本项目 GPT 线程 ({sortedActiveThreads.length})</span>
                 <span className="pill codex">并发上限 {effectiveCfg.maxParallelCodex ?? 4}</span>
+                <span className="muted" style={{ fontSize: 11.5 }}>运行中与最新线程自动置顶</span>
               </div>
               <button className="btn sm primary" onClick={() => setShowSquadDrawer((v) => !v)}>
                 {showSquadDrawer ? "收起启动台" : "+ 多开 / 启动 Subagent"}
               </button>
             </div>
+
+            {(otherProjectsThreads.length > 0 || otherProjectsApprovalCount > 0) && (
+              <div className="card subtle" style={{ padding: "8px 12px" }}>
+                <div className="row-between">
+                  <span className="muted" style={{ fontSize: 12 }}>
+                    已自动隔离：其他项目另有 <strong>{otherProjectsThreads.length}</strong> 个线程
+                    {otherProjectsApprovalCount > 0 ? `（含 ${otherProjectsApprovalCount} 项待审批）` : ""}，不会混入本项目。
+                  </span>
+                  <div className="row">
+                    {Array.from(
+                      new Map(
+                        otherProjectsThreads
+                          .filter((x) => x.projectId)
+                          .map((x) => [x.projectId!, x.projectName])
+                      ).entries()
+                    ).map(([pid, pname]) => (
+                      <button key={pid} type="button" className="btn sm" onClick={() => refresh(pid, false)}>
+                        切到「{pname}」
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )}
 
             <div className={`drawer ${showSquadDrawer ? "open" : ""}`}>
               <div className="drawer-inner">
@@ -2821,78 +3030,102 @@ export function AppView() {
               </div>
             )}
 
-            {activeThreads.length === 0 ? (
+            {sortedActiveThreads.length === 0 ? (
               <div className="empty-state">
-                <div className="section-title">当前无活跃 GPT Subagent</div>
+                <div className="section-title">当前项目暂无活跃 GPT Subagent</div>
                 <div className="muted">点击上方「+ 多开 / 启动 Subagent」，或在任务看板点「一键智能调度本波次」。</div>
               </div>
             ) : (
-              activeThreads.map((t, idx) => (
-                <div
-                  key={t.threadId}
-                  style={{ "--i": idx } as React.CSSProperties}
-                  className={`card stagger ${t.status === "running" ? "running-card" : ""}`}
-                >
-                  <div className="card-head">
-                    <div>
-                      <div className="section-title">{t.role}</div>
-                      <div className="muted" style={{ fontFamily: "var(--mono)", fontSize: 11.5 }}>
-                        {t.threadId.slice(0, 12)} · {t.model ?? "默认"}{t.effort ? ` (${t.effort})` : ""}
+              sortedActiveThreads.map((t, idx) => {
+                const isLive = t.status === "running" || t.status === "waiting_approval";
+                const isExpanded = isLive || Boolean(expandedThreads[t.threadId]);
+                const timeStr = t.updatedAt ? new Date(t.updatedAt).toLocaleTimeString() : "";
+                return (
+                  <div
+                    key={t.threadId}
+                    style={{ "--i": idx } as React.CSSProperties}
+                    className={`card stagger ${t.status === "running" ? "running-card" : ""}`}
+                  >
+                    <div className="card-head">
+                      <div>
+                        <div className="row">
+                          <div className="section-title">{t.role}</div>
+                          {idx === 0 && <span className="pill gemini" style={{ fontSize: 10 }}>最新</span>}
+                        </div>
+                        <div className="muted" style={{ fontFamily: "var(--mono)", fontSize: 11.5 }}>
+                          {t.threadId.slice(0, 12)} · {t.model ?? "默认"}{t.effort ? ` (${t.effort})` : ""}{timeStr ? ` · ${timeStr}` : ""}
+                        </div>
+                      </div>
+                      <div className="row">
+                        {!isLive && (t.latestOutput || t.reasoningSummary) && (
+                          <button
+                            type="button"
+                            className="btn sm ghost"
+                            onClick={() => setExpandedThreads((p) => ({ ...p, [t.threadId]: !isExpanded }))}
+                          >
+                            {isExpanded ? "收起详情" : "展开完整输出"}
+                          </button>
+                        )}
+                        <span className={`pill ${t.status}`}>
+                          <span className={`dot ${t.status === "running" ? "pulse" : ""}`} />
+                          {t.status}
+                        </span>
                       </div>
                     </div>
-                    <span className={`pill ${t.status}`}>
-                      <span className={`dot ${t.status === "running" ? "pulse" : ""}`} />
-                      {t.status}
-                    </span>
-                  </div>
-                  {t.lastError && <div className="pill failed">{t.lastError}</div>}
-                  {t.reasoningSummary && (
-                    <div>
-                      <div className="muted" style={{ marginBottom: 4 }}>公开推理摘要</div>
-                      <pre className="code-block">{t.reasoningSummary}</pre>
-                    </div>
-                  )}
-                  {t.latestOutput && (
-                    <div>
-                      <div className="muted" style={{ marginBottom: 4 }}>最新输出</div>
-                      <pre className="code-block">{t.latestOutput}</pre>
-                    </div>
-                  )}
-                  {t.subAgents && t.subAgents.length > 0 && (
-                    <div className="card subtle" style={{ padding: 10, gap: 6 }}>
-                      <div style={{ fontWeight: 600, fontSize: 12 }}>Codex 原生子代理 ({t.subAgents.length})</div>
-                      {t.subAgents.map((sa) => (
-                        <div key={sa.id} className="row-between">
-                          <div className="row">
-                            <span className="pill codex">{sa.tool}</span>
-                            {sa.model && <span className="muted" style={{ fontFamily: "var(--mono)" }}>{sa.model}</span>}
-                            {sa.prompt && <span className="muted">{sa.prompt.slice(0, 80)}</span>}
-                          </div>
-                          <span className={`pill ${sa.status}`}>{sa.status}</span>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                  {t.activities.length > 0 && (
-                    <div className="muted">最近活动：{t.activities.slice(-3).map((a) => `${a.title} [${a.status}]`).join(" · ")}</div>
-                  )}
-                  <div className="row">
-                    <input
-                      type="text"
-                      style={{ flex: 1 }}
-                      placeholder="实时插话纠偏 (Steer) 或追加返工指令..."
-                      value={steerInputs[t.threadId] ?? ""}
-                      onChange={(e) => setSteerInputs((p) => ({ ...p, [t.threadId]: e.target.value }))}
-                    />
-                    <button className="btn primary" onClick={() => steerCodex(t.threadId)}>
-                      <IconSend /> 发送
-                    </button>
-                    {t.status === "running" && (
-                      <button className="btn rose" onClick={() => controlCodex("interrupt", { threadId: t.threadId })}>中断</button>
+                    {t.lastError && <div className="pill failed">{t.lastError}</div>}
+                    {!isExpanded && t.latestOutput && (
+                      <div className="muted" style={{ fontSize: 12, lineHeight: 1.5, display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" }}>
+                        {t.latestOutput}
+                      </div>
                     )}
+                    {isExpanded && t.reasoningSummary && (
+                      <div>
+                        <div className="muted" style={{ marginBottom: 4 }}>公开推理摘要</div>
+                        <pre className="code-block">{t.reasoningSummary}</pre>
+                      </div>
+                    )}
+                    {isExpanded && t.latestOutput && (
+                      <div>
+                        <div className="muted" style={{ marginBottom: 4 }}>最新输出</div>
+                        <pre className="code-block">{t.latestOutput}</pre>
+                      </div>
+                    )}
+                    {t.subAgents && t.subAgents.length > 0 && (
+                      <div className="card subtle" style={{ padding: 10, gap: 6 }}>
+                        <div style={{ fontWeight: 600, fontSize: 12 }}>Codex 原生子代理 ({t.subAgents.length})</div>
+                        {t.subAgents.map((sa) => (
+                          <div key={sa.id} className="row-between">
+                            <div className="row">
+                              <span className="pill codex">{sa.tool}</span>
+                              {sa.model && <span className="muted" style={{ fontFamily: "var(--mono)" }}>{sa.model}</span>}
+                              {sa.prompt && <span className="muted">{sa.prompt.slice(0, 80)}</span>}
+                            </div>
+                            <span className={`pill ${sa.status}`}>{sa.status}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    {t.activities.length > 0 && (
+                      <div className="muted">最近活动：{t.activities.slice(-3).map((a) => `${a.title} [${a.status}]`).join(" · ")}</div>
+                    )}
+                    <div className="row">
+                      <input
+                        type="text"
+                        style={{ flex: 1 }}
+                        placeholder="实时插话纠偏 (Steer) 或追加返工指令..."
+                        value={steerInputs[t.threadId] ?? ""}
+                        onChange={(e) => setSteerInputs((p) => ({ ...p, [t.threadId]: e.target.value }))}
+                      />
+                      <button className="btn primary" onClick={() => steerCodex(t.threadId)}>
+                        <IconSend /> 发送
+                      </button>
+                      {t.status === "running" && (
+                        <button className="btn rose" onClick={() => controlCodex("interrupt", { threadId: t.threadId })}>中断</button>
+                      )}
+                    </div>
                   </div>
-                </div>
-              ))
+                );
+              })
             )}
 
             {historicalRuns.length > 0 && (
@@ -2960,16 +3193,23 @@ export function AppView() {
               </div>
             )}
 
-            {dualSideMessages.hasSides && (
-              <div className="row-between">
-                <span className="muted">检测到双盲并行研究或辩论记录</span>
-                <button className="btn sm" onClick={() => setSideBySide((v) => !v)}>
-                  {sideBySide ? "切换时间流" : "切换左右双栏"}
+            <div className="row-between">
+              <span className="muted">
+                {dualSideMessages.hasSides ? "检测到双盲并行研究或辩论记录" : `共 ${sortedMessages.length} 条协作记录`}
+              </span>
+              <div className="row">
+                <button className="btn sm ghost" onClick={() => setFeedNewestFirst((v) => !v)}>
+                  {feedNewestFirst ? "排序：最新在前" : "排序：时间正序"}
                 </button>
+                {dualSideMessages.hasSides && (
+                  <button className="btn sm" onClick={() => setSideBySide((v) => !v)}>
+                    {sideBySide ? "切换时间流" : "切换左右双栏"}
+                  </button>
+                )}
               </div>
-            )}
+            </div>
 
-            {(state?.messages.length ?? 0) === 0 ? (
+            {sortedMessages.length === 0 ? (
               <div className="empty-state">
                 <div className="section-title">暂无跨模型协作记录</div>
                 <div className="muted">Gemini 与 Codex 之间的计划、质疑、评审、自愈日志与辩论反驳会实时汇聚于此。</div>
@@ -3002,7 +3242,7 @@ export function AppView() {
                 </div>
               </div>
             ) : (
-              state!.messages.map((m, idx) => (
+              sortedMessages.map((m, idx) => (
                 <div key={m.id} style={{ "--i": idx } as React.CSSProperties} className="card stagger">
                   <div className="card-head">
                     <div className="row">
@@ -3031,41 +3271,60 @@ export function AppView() {
           </div>
         )}
 
-        {/* TAB 5: PROJECT TREE, REPO MAP & TIERED FTS5 MEMORY */}
+        {/* TAB 5: FILES, MUST-READ CONTEXT & SHARED TEAM NOTES */}
         {tab === "artifacts" && (
           <div key="stage-artifacts" className="stage">
             {!activeProject ? (
               <div className="empty-state">
                 <div className="section-title">请先绑定一个项目目录</div>
-                <div className="muted">绑定后可浏览交互式项目树、挂载焦点上下文文件、生成结构地图并管理分层记忆。</div>
+                <div className="muted">绑定后可在这里挑出「必读文件」交给双模型优先看，并在右侧记录两个 AI 共同遵守的备忘录。</div>
               </div>
             ) : (
               <>
                 <div className="grid-2">
-                  {/* LEFT: Interactive Project Tree + Context Pins + Smart Repo Map */}
+                  {/* LEFT: Plain-Chinese Project Files & Must-Read Context */}
                   <div className="card stagger" style={{ "--i": 0 } as React.CSSProperties}>
                     <div className="row-between">
                       <div>
                         <div className="section-title">
-                          项目文件树
-                          {wsInspect?.projectTree ? ` (${wsInspect.projectTree.totalFiles} 文件)` : ""}
+                          项目文件与必读资料
+                          {wsInspect?.projectTree ? `（共 ${wsInspect.projectTree.totalFiles} 个文件）` : ""}
                         </div>
-                        <div className="muted">点击文件名在侧栏打开；点「挂载」自动注入 Gemini 与 Codex 上下文</div>
+                        <div className="muted">点文件名预览；点「设为必读」后，Gemini 和 GPT 每次干活都会优先阅读它。</div>
                       </div>
-                      <div className="row">
-                        <button className="btn sm" onClick={() => setShowRepoMap((v) => !v)}>
-                          {showRepoMap ? "收起地图" : "智能项目地图"}
-                        </button>
-                        <button className="btn sm ghost" onClick={() => inspectWorkspace(activeProject.id)}>
-                          <IconRefresh />
-                        </button>
-                      </div>
+                      <button className="btn sm ghost" onClick={() => inspectWorkspace(activeProject.id)} title="重新扫描目录">
+                        <IconRefresh />
+                      </button>
                     </div>
+
+                    {/* Visual Project Content Overview (Human-Readable Replacement for Raw Text Map) */}
+                    {wsInspect?.projectMap && (() => {
+                      const stats = summarizeProjectFiles(wsInspect.projectMap.byExtension);
+                      return (
+                        <div className="card subtle" style={{ padding: "8px 10px" }}>
+                          <div className="row-between">
+                            <span style={{ fontWeight: 600, fontSize: 12 }}>项目内容一览</span>
+                            <button className="btn sm ghost" style={{ fontSize: 11 }} onClick={() => setShowRepoMap((v) => !v)}>
+                              {showRepoMap ? "收起代码大纲" : "查看技术大纲"}
+                            </button>
+                          </div>
+                          <div className="row" style={{ gap: 6 }}>
+                            <span className="pill gemini">代码脚本 {stats.code}</span>
+                            <span className="pill codex">论文/文档 {stats.doc}</span>
+                            <span className="pill done">数据/表格 {stats.data}</span>
+                            {stats.other > 0 && <span className="pill">其他 {stats.other}</span>}
+                            <span className="muted" style={{ fontSize: 11 }}>
+                              · {wsInspect.projectMap.totalDirs} 个文件夹
+                            </span>
+                          </div>
+                        </div>
+                      );
+                    })()}
 
                     {pinnedList.length > 0 && (
                       <div className="row" style={{ padding: "6px 8px", borderRadius: 8, background: "var(--indigo-soft)" }}>
                         <span style={{ fontSize: 11.5, fontWeight: 600, color: "var(--indigo)", display: "inline-flex", alignItems: "center", gap: 4 }}>
-                          <IconPin /> 已挂载焦点 ({pinnedList.length})：
+                          <IconPin /> 双模型必读资料 ({pinnedList.length})：
                         </span>
                         {pinnedList.map((pf) => (
                           <button
@@ -3073,7 +3332,7 @@ export function AppView() {
                             className="btn sm"
                             style={{ padding: "2px 8px", fontSize: 11.5 }}
                             onClick={() => togglePinFile(pf.relPath, true)}
-                            title="点击取消挂载"
+                            title="点击取消必读"
                           >
                             {pf.relPath} ×
                           </button>
@@ -3083,7 +3342,7 @@ export function AppView() {
 
                     <input
                       type="text"
-                      placeholder="按文件名或路径快速过滤项目树..."
+                      placeholder="输入文件名快速搜索..."
                       value={treeFilter}
                       onChange={(e) => setTreeFilter(e.target.value)}
                     />
@@ -3091,7 +3350,7 @@ export function AppView() {
                     <div className="tree-box">
                       {filteredTree.length === 0 ? (
                         <div className="muted" style={{ padding: 12, textAlign: "center" }}>
-                          {wsInspect?.projectTree ? "无匹配文件" : "正在扫描项目树..."}
+                          {wsInspect?.projectTree ? "没有找到匹配的文件" : "正在扫描项目目录..."}
                         </div>
                       ) : (
                         renderTreeBranch(filteredTree)
@@ -3102,57 +3361,57 @@ export function AppView() {
                       <div className="drawer-inner">
                         <div style={{ display: "flex", flexDirection: "column", gap: 6, paddingTop: 4 }}>
                           <div className="row-between">
-                            <span style={{ fontWeight: 600, fontSize: 12 }}>Aider 风格符号与科研大纲地图</span>
+                            <span style={{ fontWeight: 600, fontSize: 12 }}>技术代码大纲（自动给 AI 看的目录与函数索引）</span>
                             {canMessage && wsInspect?.projectMap && (
                               <button
                                 className="btn sm"
                                 onClick={() =>
-                                  sendToConversation(`请参考当前项目的最新结构地图（已可通过 team_project_map 获取）与已挂载焦点文件开展协作。`)
+                                  sendToConversation(`请参考项目「${activeProject.name}」的最新目录大纲与必读资料开展协作。`)
                                 }
                               >
-                                <IconSend /> 告知 Gemini
+                                <IconSend /> 提醒 Gemini 阅读
                               </button>
                             )}
                           </div>
                           <pre className="code-block" style={{ maxHeight: 190 }}>
-                            {wsInspect?.projectMap?.outline ?? "正在生成项目结构地图..."}
+                            {wsInspect?.projectMap?.outline ?? "正在生成目录大纲..."}
                           </pre>
                         </div>
                       </div>
                     </div>
 
-                    {/* Compact Git + Toolchain Footer */}
+                    {/* Compact Environment Footer */}
                     <div style={{ paddingTop: 8, borderTop: "1px solid var(--border)", display: "flex", flexDirection: "column", gap: 6 }}>
                       <div className="row-between">
                         <span className="muted" style={{ fontWeight: 600 }}>
                           {wsInspect?.workspace?.isGitRepo
-                            ? `Git · ${wsInspect.workspace.branch ?? "HEAD"}（${wsInspect.workspace.changedFiles.length} 项改动 · ${wsInspect.workspace.worktrees.length} Worktree）`
-                            : "非 Git 目录（科研/文档模式）"}
+                            ? `版本状态 · 分支 ${wsInspect.workspace.branch ?? "HEAD"}（${wsInspect.workspace.changedFiles.length} 个未提交改动）`
+                            : "普通文件夹（论文 / 调研 / PPT 模式）"}
                         </span>
                       </div>
                       {wsInspect?.workspace?.diffStat && (
                         <pre className="code-block" style={{ maxHeight: 90 }}>{wsInspect.workspace.diffStat}</pre>
                       )}
                       <div className="row">
-                        {(wsInspect?.toolchain ?? []).map((tool) => (
-                          <span key={tool.id} className={`pill ${tool.available ? "done" : ""}`}>
+                        {(wsInspect?.toolchain ?? []).filter((t) => t.available).map((tool) => (
+                          <span key={tool.id} className="pill done" title="本机已安装，AI 可直接调用">
                             <span className="dot" />
-                            {tool.label}{tool.available && tool.version ? ` ${tool.version}` : ""}
+                            {tool.label}{tool.version ? ` ${tool.version}` : ""}
                           </span>
                         ))}
                       </div>
                     </div>
                   </div>
 
-                  {/* RIGHT: Tiered SQLite FTS5 Structured Project Memory */}
+                  {/* RIGHT: Plain-Chinese Shared Team Notes / Memory */}
                   <div className="card stagger" style={{ "--i": 1 } as React.CSSProperties}>
                     <div className="row-between">
                       <div>
-                        <div className="section-title">分层共享记忆（SQLite FTS5）</div>
-                        <div className="muted">置顶条目会自动注入每一次 Codex 调度与 Gemini 协作，防止失忆与重复踩坑</div>
+                        <div className="section-title">团队共享备忘录（双模型共同记忆）</div>
+                        <div className="muted">写在这里的结论和坑，Gemini 和 GPT 都会记住，不用反复提醒或犯同一个错。</div>
                       </div>
                       <button className="btn sm primary" onClick={() => setShowAddMemory((v) => !v)}>
-                        {showAddMemory ? "收起" : "+ 新增记忆"}
+                        {showAddMemory ? "收起" : "+ 记一条备忘"}
                       </button>
                     </div>
 
@@ -3161,22 +3420,22 @@ export function AppView() {
                         <div className="card subtle" style={{ padding: 12, marginBottom: 4 }}>
                           <div className="row">
                             <select value={newMemCat} onChange={(e) => setNewMemCat(e.target.value as MemoryItemRecord["category"])}>
-                              <option value="decision">核心决策（Decision）</option>
-                              <option value="pitfall">避坑防循环（Pitfall）</option>
-                              <option value="fact">关键事实与口径（Fact）</option>
-                              <option value="convention">项目规范（Convention）</option>
+                              <option value="decision">📌 已定方案（拍板的结论）</option>
+                              <option value="pitfall">⚠️ 踩过的坑（别再重犯）</option>
+                              <option value="fact">📊 数据口径（关键数字/定义）</option>
+                              <option value="convention">📏 约定规则（格式/风格要求）</option>
                             </select>
                             <input
                               type="text"
                               style={{ flex: 1, minWidth: 160 }}
-                              placeholder="记忆标题（如：基准回归按企业聚类）"
+                              placeholder="简短标题（如：PPT 用学术深蓝配色）"
                               value={newMemTitle}
                               onChange={(e) => setNewMemTitle(e.target.value)}
                             />
                           </div>
                           <textarea
                             rows={3}
-                            placeholder="详细内容、结论依据或避坑教训..."
+                            placeholder="写下具体要求、已验证结论或避坑提醒..."
                             value={newMemContent}
                             onChange={(e) => setNewMemContent(e.target.value)}
                           />
@@ -3184,20 +3443,20 @@ export function AppView() {
                             <input
                               type="text"
                               style={{ flex: 1 }}
-                              placeholder="标签（逗号分隔，如 DID, 样本清洗）"
+                              placeholder="关键词标签（可选，逗号分隔）"
                               value={newMemTags}
                               onChange={(e) => setNewMemTags(e.target.value)}
                             />
                             <button type="button" className="switch" onClick={() => setNewMemPinned((v) => !v)}>
                               <span className={`switch-track ${newMemPinned ? "on" : ""}`}><span className="switch-thumb" /></span>
-                              <span>置顶常驻</span>
+                              <span>每次自动提醒 AI</span>
                             </button>
                             <button
                               className="btn sm primary"
                               disabled={loading || !newMemTitle.trim() || !newMemContent.trim()}
                               onClick={addMemoryItemFromUi}
                             >
-                              入库
+                              保存
                             </button>
                           </div>
                         </div>
@@ -3208,7 +3467,7 @@ export function AppView() {
                       <input
                         type="text"
                         style={{ flex: 1 }}
-                        placeholder="关键词检索记忆（支持中文/英文/标签）..."
+                        placeholder="搜索备忘录..."
                         value={memSearch}
                         onChange={(e) => setMemSearch(e.target.value)}
                       />
@@ -3216,11 +3475,11 @@ export function AppView() {
                     <div className="segmented">
                       {[
                         { id: "all", label: "全部" },
-                        { id: "pinned", label: "置顶核心" },
-                        { id: "decision", label: "决策" },
-                        { id: "pitfall", label: "避坑" },
-                        { id: "fact", label: "事实" },
-                        { id: "convention", label: "规范" },
+                        { id: "pinned", label: "必看置顶" },
+                        { id: "decision", label: "已定方案" },
+                        { id: "pitfall", label: "踩过的坑" },
+                        { id: "fact", label: "数据口径" },
+                        { id: "convention", label: "约定规则" },
                       ].map((c) => (
                         <button
                           key={c.id}
@@ -3236,7 +3495,7 @@ export function AppView() {
                     <div style={{ display: "flex", flexDirection: "column", gap: 8, maxHeight: 370, overflow: "auto" }}>
                       {filteredMemoryItems.length === 0 ? (
                         <div className="empty-state" style={{ padding: "24px 14px" }}>
-                          <div className="muted">暂无匹配的结构化记忆。点击右上角「+ 新增记忆」，或让 Gemini / Codex 自动沉淀决策与避坑记录。</div>
+                          <div className="muted">还没有备忘记录。点右上角「+ 记一条备忘」，或让 Gemini / GPT 自动把关键结论记到这里。</div>
                         </div>
                       ) : (
                         filteredMemoryItems.map((m) => (
@@ -3254,7 +3513,7 @@ export function AppView() {
                                   style={{ padding: "2px 7px", fontSize: 11 }}
                                   onClick={() => mutateMemoryItem(m.id, "toggle_pin")}
                                 >
-                                  <IconPin /> {m.pinned ? "已置顶" : "置顶"}
+                                  <IconPin /> {m.pinned ? "必看" : "置顶"}
                                 </button>
                                 <button
                                   className="btn sm ghost"
@@ -3270,7 +3529,7 @@ export function AppView() {
                               <div className="row">
                                 {m.tags.map((tag) => <span key={tag} className="pill">{tag}</span>)}
                               </div>
-                              <span className="muted" style={{ fontSize: 11 }}>{m.sourceAgent}</span>
+                              <span className="muted" style={{ fontSize: 11 }}>记录人：{m.sourceAgent}</span>
                             </div>
                           </div>
                         ))
@@ -3280,9 +3539,9 @@ export function AppView() {
                     <div style={{ paddingTop: 8, borderTop: "1px solid var(--border)" }}>
                       <div className="row-between">
                         <button className="btn sm ghost" onClick={() => setShowRawMemory((v) => !v)}>
-                          {showRawMemory ? "收起原始 memory.md" : "编辑原始 .duo-team/memory.md"}
+                          {showRawMemory ? "收起原始文档" : "查看/编辑底层 memory.md"}
                         </button>
-                        <button className="btn sm ghost" onClick={() => openWorkspaceFile(".duo-team/memory.md")}>
+                        <button className="btn sm ghost" onClick={() => openWorkspaceFile(state?.memory.path || ".duo-team/memory.md")}>
                           <IconFile /> 侧栏打开
                         </button>
                       </div>
@@ -3291,7 +3550,7 @@ export function AppView() {
                           <div style={{ display: "flex", flexDirection: "column", gap: 8, paddingTop: 8 }}>
                             <textarea rows={10} value={memoryDraft} onChange={(e) => setMemoryDraft(e.target.value)} />
                             <div className="row-between">
-                              <span className="muted">结构化记忆变更会自动同步至此文件底部快照区</span>
+                              <span className="muted">上方备忘条目会自动同步到这份文档里</span>
                               <button className="btn sm primary" onClick={saveMemory} disabled={loading}>保存原文</button>
                             </div>
                           </div>
